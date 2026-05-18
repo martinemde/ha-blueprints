@@ -1,0 +1,272 @@
+blueprint:
+  name: Lutron Pico 4 Button Scene Actions
+  description: |
+    This is for Lutron Pico 4 Button Scene which identify their buttons as button_1, button_2, button_3, and off.
+    
+    Different Actions on Short, Long, and Double Click button presses.
+
+    Make sure you have enabled at least one Pico Event Entity for each device. If no Picos show up in the drop down, check that its model matches with the model a few lines down
+  domain: automation
+  input:
+    pico_id:
+      name: Lutron Scene Pico
+      description: The Lutron Pico used to trigger the automations
+      selector:
+        device:
+          model: PJ2-4B-GXX-X31 (Pico4ButtonScene)
+          multiple: false
+    short_click_action_1:
+      name: Button 1 Short Click
+      description: The action(s) to launch for a single short click
+      default: []
+      selector:
+        action: {}
+    short_click_action_2:
+      name: Button 2 Short Click
+      description: The action(s) to launch for a single short click
+      default: []
+      selector:
+        action: {}
+    short_click_action_3:
+      name: Button 3 Short Click
+      description: The action(s) to launch for a single short click
+      default: []
+      selector:
+        action: {}
+    short_click_action_off:
+      name: Off Button Short Click
+      description: The action(s) to launch for a single short click
+      default: []
+      selector:
+        action: {}
+    long_click_action_1:
+      name: Button 1 Long Click
+      description: The action(s) to launch for a long click
+      default: []
+      selector:
+        action: {}
+    long_click_action_2:
+      name: Button 2 Long Click
+      description: The action(s) to launch for a long click
+      default: []
+      selector:
+        action: {}
+    long_click_action_3:
+      name: Button 3 Long Click
+      description: The action(s) to launch for a long click
+      default: []
+      selector:
+        action: {}
+    long_click_action_off:
+      name: Off Button Long Click
+      description: The action(s) to launch for a long click
+      default: []
+      selector:
+        action: {}
+    double_click_action_1:
+      name: Button 1 Double Click
+      description: The action(s) to launch for a double click
+      default: []
+      selector:
+        action: {}
+    double_click_action_2:
+      name: Button 2 Double Click
+      description: The action(s) to launch for a double click
+      default: []
+      selector:
+        action: {}
+    double_click_action_3:
+      name: Button 3 Double Click
+      description: The action(s) to launch for a double click
+      default: []
+      selector:
+        action: {}
+    double_click_action_off:
+      name: Off Button Double Click
+      description: The action(s) to launch for a double click
+      default: []
+      selector:
+        action: {}
+    delay_click:
+      name: Double Click Delay
+      description: The time in milliseconds used for the double click detection
+      default: 250
+      selector:
+        number:
+          min: 100
+          max: 1000
+          unit_of_measurement: milliseconds
+          step: 1
+          mode: slider
+    delay_hold:
+      name: Hold Delay
+      description: The time in milliseconds used for the hold detection
+      default: 1000
+      selector:
+        number:
+          min: 1000
+          max: 4000
+          unit_of_measurement: milliseconds
+          step: 1
+          mode: slider
+trigger:
+  - platform: device
+    device_id: !input pico_id
+    domain: lutron_caseta
+    type: press
+    subtype: button_1
+    id: button_1_pressed
+  - platform: device
+    device_id: !input pico_id
+    domain: lutron_caseta
+    type: press
+    subtype: button_2
+    id: button_2_pressed
+  - platform: device
+    device_id: !input pico_id
+    domain: lutron_caseta
+    type: press
+    subtype: button_3
+    id: button_3_pressed
+  - platform: device
+    device_id: !input pico_id
+    domain: lutron_caseta
+    type: press
+    subtype: "off"
+    id: off_pressed
+action:
+  - variables:
+      hold_ms: !input delay_hold
+      tap_ms: !input delay_click
+      pico_id: "{{ trigger.event.data.device_id }}"
+      button_name: "{{ trigger.event.data.button_type }}"
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: button_1_pressed
+        sequence:
+          - wait_for_trigger:
+              - platform: device
+                device_id: !input pico_id
+                domain: lutron_caseta
+                type: release
+                subtype: button_1
+            timeout:
+              milliseconds: "{{ hold_ms }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ wait.trigger == none }}"
+                sequence: !input long_click_action_1
+            default:
+              - wait_for_trigger:
+                  - platform: device
+                    device_id: !input pico_id
+                    domain: lutron_caseta
+                    type: press
+                    subtype: button_1
+                timeout:
+                  milliseconds: "{{ tap_ms }}"
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wait.trigger == none }}"
+                    sequence: !input short_click_action_1
+                default: !input double_click_action_1
+      - conditions:
+          - condition: trigger
+            id: button_2_pressed
+        sequence:
+          - wait_for_trigger:
+              - platform: device
+                device_id: !input pico_id
+                domain: lutron_caseta
+                type: release
+                subtype: button_2
+            timeout:
+              milliseconds: "{{ hold_ms }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ wait.trigger == none }}"
+                sequence: !input long_click_action_2
+            default:
+              - wait_for_trigger:
+                  - platform: device
+                    device_id: !input pico_id
+                    domain: lutron_caseta
+                    type: press
+                    subtype: button_2
+                timeout:
+                  milliseconds: "{{ tap_ms }}"
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wait.trigger == none }}"
+                    sequence: !input short_click_action_2
+                default: !input double_click_action_2
+      - conditions:
+          - condition: trigger
+            id: button_3_pressed
+        sequence:
+          - wait_for_trigger:
+              - platform: device
+                device_id: !input pico_id
+                domain: lutron_caseta
+                type: release
+                subtype: button_3
+            timeout:
+              milliseconds: "{{ hold_ms }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ wait.trigger == none }}"
+                sequence: !input long_click_action_3
+            default:
+              - wait_for_trigger:
+                  - platform: device
+                    device_id: !input pico_id
+                    domain: lutron_caseta
+                    type: press
+                    subtype: button_3
+                timeout:
+                  milliseconds: "{{ tap_ms }}"
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wait.trigger == none }}"
+                    sequence: !input short_click_action_3
+                default: !input double_click_action_3
+      - conditions:
+          - condition: trigger
+            id: off_pressed
+        sequence:
+          - wait_for_trigger:
+              - platform: device
+                device_id: !input pico_id
+                domain: lutron_caseta
+                type: release
+                subtype: "off"
+            timeout:
+              milliseconds: "{{ hold_ms }}"
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ wait.trigger == none }}"
+                sequence: !input long_click_action_off
+            default:
+              - wait_for_trigger:
+                  - platform: device
+                    device_id: !input pico_id
+                    domain: lutron_caseta
+                    type: press
+                    subtype: "off"
+                timeout:
+                  milliseconds: "{{ tap_ms }}"
+              - choose:
+                  - conditions:
+                      - condition: template
+                        value_template: "{{ wait.trigger == none }}"
+                    sequence: !input short_click_action_off
+                default: !input double_click_action_off
+mode: single
