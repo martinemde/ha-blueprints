@@ -1,0 +1,256 @@
+blueprint:
+  name: Smart Lava Lamp Controller
+  description: >
+    Controls a lava lamp like a thermostat with ambient temperature awareness
+    and wax-safe timing constraints.
+
+    - Turns on automatically when ambient temperature is below the threshold
+    - Enforces minimum run time to protect wax during heat-up
+    - Enforces minimum off time to prevent short-cycling
+    - Forces off after maximum run time regardless of conditions
+    - Manual off is always respected
+    - Manual on respects minimum run time before automation can turn off
+    - Optional warmup profile for lava lamps on dimmer switches: runs at full
+      brightness during warmup, then drops to a maintenance level for ideal lava flow
+
+  domain: automation
+  input:
+    light_entity:
+      name: Lava Lamp
+      description: The light or switch entity controlling the lava lamp.
+      selector:
+        entity:
+          domain: light
+
+    temp_sensor:
+      name: Temperature Sensor
+      description: Ambient temperature sensor used to decide when to run the lamp.
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+
+    temp_threshold:
+      name: Temperature Threshold (°F)
+      description: >
+        Lamp will turn on automatically below this temperature, and turn off
+        when it rises above it (after minimum run time).
+      default: 68
+      selector:
+        number:
+          min: 50
+          max: 85
+          unit_of_measurement: "°F"
+
+    min_run_minutes:
+      name: Minimum Run Time (minutes)
+      description: >
+        Minimum time the lamp must stay on after turning on, whether triggered
+        automatically or manually. Protects wax from being left in a bad state.
+      default: 120
+      selector:
+        number:
+          min: 30
+          max: 480
+          unit_of_measurement: "min"
+
+    max_run_minutes:
+      name: Maximum Run Time (minutes)
+      description: >
+        Maximum continuous run time. Lamp will be forced off after this duration
+        regardless of temperature. Protects bulb and wax from extended heat exposure.
+      default: 480
+      selector:
+        number:
+          min: 60
+          max: 720
+          unit_of_measurement: "min"
+
+    min_off_minutes:
+      name: Minimum Off Time (minutes)
+      description: >
+        Minimum time the lamp must remain off before it can turn on again.
+        Prevents short-cycling and allows wax to cool and reset.
+      default: 60
+      selector:
+        number:
+          min: 15
+          max: 240
+          unit_of_measurement: "min"
+
+    warmup_enabled:
+      name: Enable Warmup Profile
+      description: >
+        Enable a two-stage brightness profile for lava lamps on dimmer switches.
+        Runs at full brightness during warmup to get the wax moving, then drops
+        to a lower maintenance level for ideal lava flow and to prevent overheating.
+        Only works if the lamp entity supports brightness control.
+      default: false
+      selector:
+        boolean:
+
+    warmup_brightness:
+      name: Warmup Brightness (%)
+      description: Brightness level during the warmup period. Default is full power.
+      default: 100
+      selector:
+        number:
+          min: 50
+          max: 100
+          unit_of_measurement: "%"
+
+    warmup_duration_minutes:
+      name: Warmup Duration (minutes)
+      description: >
+        How long to run at warmup brightness before switching to maintenance level.
+        A good starting point is 60–90 minutes; longer in colder rooms.
+      default: 75
+      selector:
+        number:
+          min: 15
+          max: 240
+          unit_of_measurement: "min"
+
+    maintenance_brightness:
+      name: Maintenance Brightness (%)
+      description: >
+        Brightness level after warmup. Lower wattage reduces heat and keeps lava
+        flowing without boiling. 70–80% is typical.
+      default: 75
+      selector:
+        number:
+          min: 30
+          max: 100
+          unit_of_measurement: "%"
+
+variables:
+  light_entity: !input light_entity
+  temp_sensor: !input temp_sensor
+  temp_threshold: !input temp_threshold
+  min_run_minutes: !input min_run_minutes
+  max_run_minutes: !input max_run_minutes
+  min_off_minutes: !input min_off_minutes
+  warmup_enabled: !input warmup_enabled
+  warmup_brightness: !input warmup_brightness
+  warmup_duration_minutes: !input warmup_duration_minutes
+  maintenance_brightness: !input maintenance_brightness
+
+trigger:
+  # Temperature crossed threshold (either direction)
+  - platform: numeric_state
+    entity_id: !input temp_sensor
+    above: !input temp_threshold
+    id: temp_too_warm
+
+  - platform: numeric_state
+    entity_id: !input temp_sensor
+    below: !input temp_threshold
+    id: temp_cool_enough
+
+  # Lamp turned on (manual or automation)
+  - platform: state
+    entity_id: !input light_entity
+    to: "on"
+    id: lamp_turned_on
+
+  # Lamp turned off (manual or automation)
+  - platform: state
+    entity_id: !input light_entity
+    to: "off"
+    id: lamp_turned_off
+
+  # Time-based: check for max run time exceeded (poll every 5 min)
+  - platform: time_pattern
+    minutes: "/5"
+    id: time_check
+
+action:
+  - choose:
+
+      # ── Temp dropped below threshold → try to turn on ──────────────────────
+      - conditions:
+          - condition: trigger
+            id: temp_cool_enough
+          - condition: state
+            entity_id: !input light_entity
+            state: "off"
+          - condition: template
+            value_template: >
+              {% set last_off = states[light_entity].last_changed %}
+              {{ (now() - last_off).total_seconds() / 60 >= min_off_minutes }}
+        sequence:
+          - service: light.turn_on
+            target:
+              entity_id: !input light_entity
+            data:
+              brightness_pct: >
+                {% if warmup_enabled %}
+                  {{ warmup_brightness }}
+                {% else %}
+                  100
+                {% endif %}
+
+      # ── Temp rose above threshold → try to turn off ─────────────────────────
+      - conditions:
+          - condition: trigger
+            id: temp_too_warm
+          - condition: state
+            entity_id: !input light_entity
+            state: "on"
+          - condition: template
+            value_template: >
+              {% set last_on = states[light_entity].last_changed %}
+              {{ (now() - last_on).total_seconds() / 60 >= min_run_minutes }}
+        sequence:
+          - service: light.turn_off
+            target:
+              entity_id: !input light_entity
+
+      # ── Lamp turned on → schedule warmup transition (if enabled) ───────────
+      - conditions:
+          - condition: trigger
+            id: lamp_turned_on
+          - condition: template
+            value_template: "{{ warmup_enabled }}"
+          - condition: template
+            value_template: >
+              {{ state_attr(light_entity, 'supported_color_modes') is not none
+                 and 'brightness' in (state_attr(light_entity, 'supported_color_modes') | default([])) }}
+        sequence:
+          - delay:
+              minutes: "{{ warmup_duration_minutes }}"
+          # Re-check lamp is still on before dimming
+          - condition: state
+            entity_id: !input light_entity
+            state: "on"
+          - service: light.turn_on
+            target:
+              entity_id: !input light_entity
+            data:
+              brightness_pct: "{{ maintenance_brightness }}"
+
+      # ── Time check → enforce max run time ──────────────────────────────────
+      - conditions:
+          - condition: trigger
+            id: time_check
+          - condition: state
+            entity_id: !input light_entity
+            state: "on"
+          - condition: template
+            value_template: >
+              {% set last_on = states[light_entity].last_changed %}
+              {{ (now() - last_on).total_seconds() / 60 >= max_run_minutes }}
+        sequence:
+          - service: light.turn_off
+            target:
+              entity_id: !input light_entity
+          - service: persistent_notification.create
+            data:
+              title: "Lava Lamp: Max Runtime Reached"
+              message: >
+                {{ light_entity }} was turned off after reaching the maximum
+                run time of {{ max_run_minutes }} minutes.
+              notification_id: "lava_lamp_max_runtime"
+
+mode: queued
+max: 10
