@@ -38,7 +38,10 @@ blueprint:
         binary sensor that represents "evening", "movie time", etc.
       selector:
         entity:
-          domain: binary_sensor
+          domain:
+            - binary_sensor
+            - schedule
+            - input_boolean
 
     temp_sensor:
       name: Temperature Sensor
