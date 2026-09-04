@@ -1,14 +1,43 @@
 # Source: https://github.com/KipK/aqara-w100-z2m-converter/blob/main/w100-blueprint.yaml
-# Vendored verbatim; no source_url so HA's re-import can't pull from upstream over this copy.
+# Vendored, then diverged; no source_url so HA's re-import can't pull from upstream over this copy.
+#
+# The rewrite replaces upstream's "the two state strings must be equal" model,
+# which deadlocks whenever the main thermostat sits in a mode the W100 cannot
+# represent. The W100 offers off/heat/cool/auto; a heat pump also offers
+# fan_only, dry and heat_cool. Set the main to fan_only and upstream pushes
+# `fan_only` at the W100, which rejects it and aborts the run, leaving a
+# mismatch no push can ever clear. The W100 reports temperature and humidity
+# every few minutes, and a state trigger with no `to:` fires on attribute
+# changes, so within minutes the reverse branch reads that same mismatch as a
+# wall press and drags the main thermostat back to cool.
+#
+# Instead every main mode projects onto the mode the W100 *should* be reading
+# (see w100_target_mode), and the W100 only gets a vote when it disagrees with
+# its own projection. Modes the W100 cannot show collapse onto `off`, so a
+# mismatch is never permanent and the heartbeat has nothing to act on.
 blueprint:
   name: Aqara W100 Thermostat Synchronization
   description: |
-    Synchronizes an Aqara W100 climate controller with a main thermostat entity.
-    Supports bidirectional sync for HVAC mode, temperature, and fan mode.
-    Optionally publishes external temperature and humidity data to the W100 display.
-    Configure which HVAC modes and features your system supports.
+    Synchronizes an Aqara W100 wall controller with a main thermostat entity.
+
+    The main thermostat is authoritative. Its mode is projected onto what the
+    W100 can display — heat, cool and auto pass through, and every other mode
+    (off, fan_only, dry, heat_cool) shows as `off`. The W100 is only believed
+    when it disagrees with that projection, which means somebody turned the
+    dial.
+
+    The setpoint is synchronized only in heat, cool and auto: in the modes that
+    project to `off` nothing in the band is driving anything, so there is no
+    number worth agreeing on.
+
+    Because the W100 has no fan-off setting, "off but still moving air" is not
+    a state it can report — only a gesture. Changing the fan speed while the
+    W100 reads `off` puts the main thermostat into fan_only at that speed.
+
+    Optionally publishes external temperature and humidity to the W100 display.
+
   domain: automation
-  
+
   input:
     main_thermostat:
       name: Main Thermostat
@@ -42,7 +71,9 @@ blueprint:
         boolean:
     hvac_has_vent:
       name: Fan Mode Support
-      description: Enable if your HVAC system supports fan mode control
+      description: >-
+        Enable if your HVAC system supports fan speed control. Also enables the
+        fan-while-off gesture that selects fan_only.
       default: false
       selector:
         boolean:
@@ -93,6 +124,46 @@ variables:
   thermostat_mode_switch: >-
     {{ 'switch.' ~ aqara_w100.split('.')[1] ~ '_thermostat_mode' }}
 
+  # The mode the W100 should be displaying for the main thermostat's current
+  # mode. heat/cool/auto pass through; everything the W100 cannot show —
+  # fan_only, dry, heat_cool and off itself — reads as off. This is the whole
+  # contract: outbound we push it, inbound we treat any difference from it as
+  # a wall press.
+  w100_target_mode: >-
+    {% set m = states(main_thermostat) %}
+    {{ m if m in ['heat', 'cool', 'auto'] else 'off' }}
+
+  # A setpoint only means something in the modes that survive the projection.
+  # In the rest the source still holds a band, but nothing in it is driving,
+  # and the main thermostat may well report no temperature at all.
+  setpoint_is_live: "{{ w100_target_mode in ['heat', 'cool', 'auto'] }}"
+
+  main_setpoint: "{{ state_attr(main_thermostat, 'temperature') }}"
+  w100_setpoint: "{{ state_attr(aqara_w100, 'temperature') }}"
+
+  # Fan names differ between integrations ("Med" vs "medium"); compare on a
+  # lowercased, medium-normalized form and translate back per target below.
+  main_fan: >-
+    {% set f = (state_attr(main_thermostat, 'fan_mode') or '') | lower %}
+    {{ 'medium' if f == 'med' else f }}
+  w100_fan: >-
+    {% set f = (state_attr(aqara_w100, 'fan_mode') or '') | lower %}
+    {{ 'medium' if f == 'med' else f }}
+  fan_differs: >-
+    {{ hvac_has_vent | default(false) | bool
+       and main_fan != ''
+       and w100_fan != ''
+       and main_fan != w100_fan }}
+
+  main_has_fan_only: >-
+    {{ 'fan_only' in (state_attr(main_thermostat, 'hvac_modes') or []) }}
+
+  # Both entities present and settled. Without this an HA restart, which takes
+  # both through `unavailable`, would project to `off` and switch the W100 off.
+  both_available: >-
+    {{ states(main_thermostat) not in ['unknown', 'unavailable']
+       and states(aqara_w100) not in ['unknown', 'unavailable'] }}
+
 triggers:
   - trigger: state
     entity_id: !input main_thermostat
@@ -113,168 +184,180 @@ conditions: []
 
 actions:
   - choose:
+      # --- Main thermostat changed: assert the projection on the W100 -------
       - conditions:
           - condition: trigger
             id:
               - climate_state
           - condition: template
-            value_template: >-
-              {{ is_state(thermostat_mode_switch, 'on') }}
+            value_template: "{{ both_available }}"
+          - condition: template
+            value_template: "{{ is_state(thermostat_mode_switch, 'on') }}"
         sequence:
           - if:
               - condition: template
-                value_template: >-
-                  {{ states(main_thermostat) != states(aqara_w100) }}
-              - condition: template
-                value_template: >-
-                  {{ is_state(thermostat_mode_switch, 'on') }}
+                value_template: "{{ states(aqara_w100) != w100_target_mode }}"
             then:
               - action: climate.set_hvac_mode
                 target:
                   entity_id: !input aqara_w100
                 data:
-                  hvac_mode: |
-                    {{ states(main_thermostat) }}
+                  hvac_mode: "{{ w100_target_mode }}"
               - delay:
                   seconds: "{{ sync_delay }}"
+          # Tolerance is just under half the W100's 0.5 °F step: it absorbs the
+          # float noise of a °C round trip without swallowing a real nudge.
+          # Without it the two ends chase each other every heartbeat.
           - if:
               - condition: template
                 value_template: >-
-                  {{ state_attr(main_thermostat, "temperature") !=
-                  state_attr(aqara_w100, "temperature") }}
+                  {{ setpoint_is_live
+                     and main_setpoint is not none
+                     and (w100_setpoint is none
+                          or (main_setpoint - w100_setpoint) | abs > 0.4) }}
             then:
               - action: climate.set_temperature
                 target:
                   entity_id: !input aqara_w100
                 data:
-                  temperature: |
-                    {{ state_attr(main_thermostat, "temperature") }}
+                  temperature: "{{ main_setpoint }}"
               - delay:
                   seconds: "{{ sync_delay }}"
+          # The fan syncs in every mode, including off — that is what makes the
+          # W100 read "off, still moving air", and what lets the gesture below
+          # tell a wall press apart from our own push.
           - if:
               - condition: template
-                value_template: >-
-                  {# Define the variables#}
-                  {% set source = state_attr(main_thermostat, "fan_mode") %}
-                  {% set target = state_attr(aqara_w100, "fan_mode") %}
-                  {# Normalize the source to lowercase and map med->medium for comparison #}
-                  {% set source_norm = 'medium' if source | lower == 'med' else source | lower %}
-                  {# Compare normalized values #}
-                  {{ 
-                    (source_norm != target) and 
-                    (hvac_has_vent | default(false) | bool) 
-                  }}
+                value_template: "{{ fan_differs }}"
             then:
               - action: climate.set_fan_mode
                 target:
                   entity_id: !input aqara_w100
                 data:
-                  fan_mode: |
-                    {% set source = state_attr(main_thermostat, "fan_mode") %}
-                    {# If source is med/medium, pass "medium" to the Aqara #}
-                    {% if source | lower == 'med' or source | lower == 'medium' %}
-                      medium
-                    {# Otherwise just pass the source through #}
-                    {% else %}
-                      {{ source }}
-                    {% endif %}
+                  fan_mode: >-
+                    {{ (state_attr(aqara_w100, 'fan_modes') or [])
+                       | select('search', '(?i)^' ~ main_fan)
+                       | first | default(main_fan) }}
               - delay:
                   seconds: "{{ sync_delay }}"
-      
+
+      # --- W100 changed: believe it only where it contradicts the projection -
       - conditions:
           - condition: trigger
             id:
               - w100_climate_state
           - condition: template
-            value_template: >-
-              {{ is_state(thermostat_mode_switch, 'on') }}
+            value_template: "{{ both_available }}"
+          - condition: template
+            value_template: "{{ is_state(thermostat_mode_switch, 'on') }}"
         sequence:
-          - if:
-              - condition: template
-                value_template: |
-                  {{
-                    (states(main_thermostat) != states(aqara_w100)) and
-                    (
-                      (is_state(aqara_w100, 'heat') and (hvac_has_heat | default(false) | bool)) or
-                      (is_state(aqara_w100, 'cool') and (hvac_has_cool | default(false) | bool)) or
-                      (is_state(aqara_w100, 'auto') and (hvac_has_auto | default(false) | bool)) or
-                      (is_state(aqara_w100, 'off'))
-                    )
-                  }}
-            then:
-              - action: climate.set_hvac_mode
-                data:
-                  hvac_mode: |
-                    {{ states(aqara_w100) }}
-                target:
-                  entity_id: !input main_thermostat
-              - delay:
-                  seconds: "{{ sync_delay }}"
-            else:
-              - if:
+          - choose:
+              # The wall shows a mode the system cannot run. Don't push it to
+              # the main thermostat and don't guess a replacement — re-assert
+              # the projection, which is by definition something both ends can
+              # hold.
+              - conditions:
                   - condition: template
-                    value_template: |
-                      {{
-                        (is_state(aqara_w100, 'heat') and not (hvac_has_heat | default(false) | bool)) or
-                        (is_state(aqara_w100, 'cool') and not (hvac_has_cool | default(false) | bool)) or
-                        (is_state(aqara_w100, 'auto') and not (hvac_has_auto | default(false) | bool))
-                      }}
-                then:
+                    value_template: >-
+                      {{ states(aqara_w100) != w100_target_mode and (
+                           (is_state(aqara_w100, 'heat') and not (hvac_has_heat | default(false) | bool)) or
+                           (is_state(aqara_w100, 'cool') and not (hvac_has_cool | default(false) | bool)) or
+                           (is_state(aqara_w100, 'auto') and not (hvac_has_auto | default(false) | bool))
+                         ) }}
+                sequence:
                   - action: climate.set_hvac_mode
-                    metadata: {}
-                    data:
-                      hvac_mode: heat
                     target:
                       entity_id: !input aqara_w100
+                    data:
+                      hvac_mode: "{{ w100_target_mode }}"
                   - delay:
                       seconds: "{{ sync_delay }}"
-          - if:
-              - condition: template
-                value_template: >-
-                  {{ state_attr(main_thermostat, "temperature") !=
-                  state_attr(aqara_w100, "temperature") }}
-            then:
-              - action: climate.set_temperature
-                data:
-                  temperature: |
-                    {{ state_attr(aqara_w100, "temperature") }}
-                target:
-                  entity_id: !input main_thermostat
-              - delay:
-                  seconds: "{{ sync_delay }}"
-          - if:
-              - condition: template
-                value_template: >-
-                  {# Define the variables#}
-                  {% set source = state_attr(main_thermostat, "fan_mode") %}
-                  {% set target = state_attr(aqara_w100, "fan_mode") %}
-                  {# Normalize source to lowercase and map med->medium for comparison #}
-                  {% set source_norm = 'medium' if source | lower == 'med' else source | lower %}
-                  {# Compare normalized values #}
-                  {{ 
-                    (source_norm != target) and 
-                    (hvac_has_vent | default(false) | bool) 
-                  }}
-            then:
-              - action: climate.set_fan_mode
-                target:
-                  entity_id: !input main_thermostat
-                data:
-                  fan_mode: |
-                    {% set source = state_attr(aqara_w100, "fan_mode") %}
-                    {% set target_valid_list = state_attr(main_thermostat, "fan_modes") %}
-                    
-                    {# If source is med/medium, find the target's specific medium mode #}
-                    {% if source | lower == 'med' or source | lower == 'medium' %}
-                      {{ target_valid_list | select('search', '(?i)^med') | first | default(source) }}
-                      
-                    {# Otherwise just pass the source through #}
-                    {% else %}
-                      {{ source }}
-                    {% endif %}
-              - delay:
-                  seconds: "{{ sync_delay }}"
 
+              # A real wall press: the W100 holds a mode the system supports
+              # and the projection did not put it there.
+              - conditions:
+                  - condition: template
+                    value_template: "{{ states(aqara_w100) != w100_target_mode }}"
+                sequence:
+                  - action: climate.set_hvac_mode
+                    target:
+                      entity_id: !input main_thermostat
+                    data:
+                      hvac_mode: "{{ states(aqara_w100) }}"
+                  - delay:
+                      seconds: "{{ sync_delay }}"
+
+              # The W100 has no fan-off setting, so "off but give me air" can
+              # only arrive as a gesture: the fan speed moved while the W100
+              # reads off. Gated on the speeds differing, because the outbound
+              # push always equalizes them — a difference means the wall moved
+              # it and we did not. Without that guard, changing the fan from
+              # Home Assistant while the system is off would echo back through
+              # here and start the fan.
+              - conditions:
+                  - condition: template
+                    value_template: >-
+                      {{ is_state(aqara_w100, 'off')
+                         and fan_differs
+                         and main_has_fan_only }}
+                sequence:
+                  - if:
+                      - condition: template
+                        value_template: "{{ not is_state(main_thermostat, 'fan_only') }}"
+                    then:
+                      - action: climate.set_hvac_mode
+                        target:
+                          entity_id: !input main_thermostat
+                        data:
+                          hvac_mode: fan_only
+                      - delay:
+                          seconds: "{{ sync_delay }}"
+                  - action: climate.set_fan_mode
+                    target:
+                      entity_id: !input main_thermostat
+                    data:
+                      fan_mode: >-
+                        {{ (state_attr(main_thermostat, 'fan_modes') or [])
+                           | select('search', '(?i)^' ~ w100_fan)
+                           | first | default(w100_fan) }}
+                  - delay:
+                      seconds: "{{ sync_delay }}"
+
+              # In sync on mode. Accept the wall's setpoint and fan.
+              - conditions:
+                  - condition: template
+                    value_template: "{{ setpoint_is_live }}"
+                sequence:
+                  - if:
+                      - condition: template
+                        value_template: >-
+                          {{ w100_setpoint is not none
+                             and (main_setpoint is none
+                                  or (main_setpoint - w100_setpoint) | abs > 0.4) }}
+                    then:
+                      - action: climate.set_temperature
+                        target:
+                          entity_id: !input main_thermostat
+                        data:
+                          temperature: "{{ w100_setpoint }}"
+                      - delay:
+                          seconds: "{{ sync_delay }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ fan_differs }}"
+                    then:
+                      - action: climate.set_fan_mode
+                        target:
+                          entity_id: !input main_thermostat
+                        data:
+                          fan_mode: >-
+                            {{ (state_attr(main_thermostat, 'fan_modes') or [])
+                               | select('search', '(?i)^' ~ w100_fan)
+                               | first | default(w100_fan) }}
+                      - delay:
+                          seconds: "{{ sync_delay }}"
+
+      # --- External temperature / humidity to the W100 display --------------
       - conditions:
           - condition: trigger
             id:
@@ -293,8 +376,7 @@ actions:
                   entity_id: >-
                     {{ 'number.' ~ aqara_w100.split('.')[1] ~ '_external_temperature' }}
                 data:
-                  value: |
-                    {{ states(external_temperature_sensor) | float }}
+                  value: "{{ states(external_temperature_sensor) | float }}"
               - delay:
                   seconds: "{{ sync_delay }}"
           - if:
@@ -307,8 +389,7 @@ actions:
                   entity_id: >-
                     {{ 'number.' ~ aqara_w100.split('.')[1] ~ '_external_humidity' }}
                 data:
-                  value: |
-                    {{ states(external_humidity_sensor) | float }}
+                  value: "{{ states(external_humidity_sensor) | float }}"
               - delay:
                   seconds: "{{ sync_delay }}"
 
